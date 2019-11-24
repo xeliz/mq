@@ -4,7 +4,7 @@
 # No authentication supported.
 #
 # Methods:
-#   POST /mq/queue_name/push [ JSON ]        - add a new message to a queue
+#   POST /mq/queue_name/push [ JSON ]        - add a new message to a queue and get its id
 #   POST /mq/queue_name/pop [ ?n=how_many ]  - remove and get at most n messages from a queue, default is 1
 #   GET /mq/queue_name [ ?n=how_many ]       - get at most n messages from a queue, default is 1
 #   GET /mq/queue_name/count                 - get a number of messages in a queue
@@ -16,6 +16,7 @@
 import flask
 import werkzeug.exceptions
 import sqlite3
+import json
 
 app = flask.Flask(__name__)
 
@@ -92,10 +93,12 @@ class QueuesDAO:
         self.check_queue(qname)
         con = sqlite3.connect(QueuesDAO.DB_FILE)
         cur = con.cursor()
-        cur.execute(QueuesDAO.PUSH_MESSAGE, (qname, message))
+        cur.execute(QueuesDAO.PUSH_MESSAGE, (qname, json.dumps(message)))
+        message_id = cur.lastrowid
         cur.close()
         con.commit()
         con.close()
+        return message_id
 
     # pop at most n messages from the end
     def pop(self, qname, n=1):
@@ -107,7 +110,10 @@ class QueuesDAO:
         messages = []
         for row in result:
             ids.append(row[0])
-            messages.append(row[1])
+            messages.append({
+                "id": row[0],
+                "message": json.loads(row[1]),
+            })
         if ids:
             query = QueuesDAO.DELETE_MESSAGES + "(" + ",".join(["?"] * len(ids)) + ")"
             cur.execute(query, ids)
@@ -125,7 +131,10 @@ class QueuesDAO:
         result = cur.execute(QueuesDAO.GET_MESSAGES, (qname, n))
         messages = []
         for row in result:
-            messages.append(row[1])
+            messages.append({
+                "id": row[0],
+                "message": json.loads(row[1]),
+            })
         cur.close()
         con.commit()
         con.close()
@@ -181,8 +190,8 @@ def mq_push(qname):
     data = flask.request.json
     if data is None:
         raise TypeError("Not a JSON value")
-    queuesDAO.push(qname, data)
-    return flask.jsonify({})
+    message_id = queuesDAO.push(qname, data)
+    return flask.jsonify({"id": message_id})
 
 # pop messages from queue
 @app.route("/mq/<qname>/pop", methods=["POST"])
