@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # A simple (primitive) message queue handler in Python
-# Not persistent, not transactional. Also, no authentication.
+# No authentication supported.
 #
 # Methods:
 #   POST /mq/queue_name/push [ JSON ]        - add a new message to a queue
@@ -15,6 +15,7 @@
 
 import flask
 import werkzeug.exceptions
+import sqlite3
 
 app = flask.Flask(__name__)
 
@@ -24,56 +25,154 @@ MAX_MESSAGES_REQUEST_NUMBER = 100
 # DAO for working with queues
 # Has "in-memory" implementation
 class QueuesDAO:
-    __queues = {
-        "default": []
-    }
+    DB_FILE  = "mq.db"
+
+    CHECK_TABLE_EXISTS = "select * from sqlite_master where type='table' and name = ?"
+
+    # TODO: mixing DDL and code is bad, should be refactored.
+    CREATE_QUEUES = ("create table queues ("
+            + "id integer not null primary key,"
+            + "name varchar(100) not null unique)")
+
+    CREATE_MESSAGES = ("create table messages ("
+            + "id integer not null primary key,"
+            + "queue_id integer not null,"
+            + "message text not null,"
+            + "foreign key (queue_id) references queues(id))")
+
+    CHECK_QUEUE_EXISTS = "select * from queues where name = ?"
+
+    PUSH_MESSAGE = ("insert into messages (queue_id, message) values ("
+            + "(select id from queues where name = ?),"
+            + "?)")
+
+    GET_MESSAGES = ("select id, message from messages where queue_id = ("
+            + "select id from queues where name = ?)"
+            + "order by id asc limit ?")
+
+    DELETE_MESSAGES = "delete from messages where id in "
+
+    COUNT_MESSAGES = ("select count(*) from messages where queue_id = "
+            + "(select id from queues where name = ?)")
+
+    CREATE_QUEUE = "insert into queues (name) values (?)"
+
+    DELETE_QUEUE_MESSAGES = ("delete from messages where queue_id = "
+            + "(select id from queues where name = ?)")
+
+    DELETE_QUEUE = "delete from queues where name = ?"
+    
+    LIST_QUEUES = "select name from queues order by name asc"
+
+    def init_db(self):
+        con = sqlite3.connect(QueuesDAO.DB_FILE)
+        cur = con.cursor()
+        if not cur.execute(QueuesDAO.CHECK_TABLE_EXISTS, ("queues",)).fetchall():
+            cur.execute(QueuesDAO.CREATE_QUEUES)
+            cur.execute("insert into queues (name) values ('default')")
+        if not cur.execute(QueuesDAO.CHECK_TABLE_EXISTS, ("messages",)).fetchall():
+            cur.execute(QueuesDAO.CREATE_MESSAGES)
+        cur.close()
+        con.commit()
+        con.commit()
+        con.close()
 
     # check if a queue (not) exists
     def check_queue(self, qname):
-        if qname not in QueuesDAO.__queues:
+        con = sqlite3.connect(QueuesDAO.DB_FILE)
+        cur = con.cursor()
+        if not cur.execute(QueuesDAO.CHECK_QUEUE_EXISTS, (qname,)).fetchall():
             raise ValueError("No such queue: '{}'".format(qname))
+        cur.close()
+        con.commit()
+        con.close()
 
     # add a message at the beginning
-    def push(self, qname, msg):
+    def push(self, qname, message):
         self.check_queue(qname)
-        QueuesDAO.__queues[qname].insert(0, msg)
+        con = sqlite3.connect(QueuesDAO.DB_FILE)
+        cur = con.cursor()
+        cur.execute(QueuesDAO.PUSH_MESSAGE, (qname, message))
+        cur.close()
+        con.commit()
+        con.close()
 
     # pop at most n messages from the end
     def pop(self, qname, n=1):
         self.check_queue(qname)
-        msgs = []
-        i = n
-        while QueuesDAO.__queues[qname] and i > 0:
-            msgs.append(QueuesDAO.__queues[qname].pop())
-            i -= 1
-        return msgs
+        con = sqlite3.connect(QueuesDAO.DB_FILE)
+        cur = con.cursor()
+        result = cur.execute(QueuesDAO.GET_MESSAGES, (qname, n))
+        ids = []
+        messages = []
+        for row in result:
+            ids.append(row[0])
+            messages.append(row[1])
+        if ids:
+            query = QueuesDAO.DELETE_MESSAGES + "(" + ",".join(["?"] * len(ids)) + ")"
+            cur.execute(query, ids)
+        cur.close()
+        con.commit()
+        con.close()
+        return messages
 
     # get at most n messages from the end.
     # like pop(), but without removing
     def get(self, qname, n=1):
         self.check_queue(qname)
-        return QueuesDAO.__queues[qname][-n:]
+        con = sqlite3.connect(QueuesDAO.DB_FILE)
+        cur = con.cursor()
+        result = cur.execute(QueuesDAO.GET_MESSAGES, (qname, n))
+        messages = []
+        for row in result:
+            messages.append(row[1])
+        cur.close()
+        con.commit()
+        con.close()
+        return messages
 
     # get number of messages in queue
     def count(self, qname):
         self.check_queue(qname)
-        return len(QueuesDAO.__queues[qname])
+        con = sqlite3.connect(QueuesDAO.DB_FILE)
+        cur = con.cursor()
+        n = cur.execute(QueuesDAO.COUNT_MESSAGES, (qname,)).fetchone()[0]
+        cur.close()
+        con.commit()
+        con.close()
+        return n
 
     # create a queue if it not exists
     def create(self, qname):
-        if qname in QueuesDAO.__queues:
-            return
-        QueuesDAO.__queues[qname] = []
+        con = sqlite3.connect(QueuesDAO.DB_FILE)
+        cur = con.cursor()
+        try:
+            cur.execute(QueuesDAO.CREATE_QUEUE, (qname,))
+        except sqlite3.IntegrityError:
+            pass
+        cur.close()
+        con.commit()
+        con.close()
 
     # delete a queue if it exists
     def delete(self, qname):
-        if qname not in QueuesDAO.__queues:
-            return
-        del QueuesDAO.__queues[qname]
+        con = sqlite3.connect(QueuesDAO.DB_FILE)
+        cur = con.cursor()
+        cur.execute(QueuesDAO.DELETE_QUEUE_MESSAGES, (qname,))
+        cur.execute(QueuesDAO.DELETE_QUEUE, (qname,))
+        cur.close()
+        con.commit()
+        con.close()
 
     # returns a list of existing queues
     def list(self):
-        return list(QueuesDAO.__queues.keys())
+        con = sqlite3.connect(QueuesDAO.DB_FILE)
+        cur = con.cursor()
+        queues = cur.execute(QueuesDAO.LIST_QUEUES).fetchall()
+        cur.close()
+        con.commit()
+        con.close()
+        return [q[0] for q in queues]
 
 # push message to queue
 @app.route("/mq/<qname>/push", methods=["POST"])
@@ -155,6 +254,9 @@ def handle_server_error(e):
     return flask.jsonify({
         "error": str(e)
     }), 500
+
+# initialize DB
+QueuesDAO().init_db()
 
 # development server
 if __name__ == "__main__":
