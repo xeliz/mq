@@ -75,7 +75,6 @@ class QueuesDAO:
             cur.execute(QueuesDAO.CREATE_MESSAGES)
         cur.close()
         con.commit()
-        con.commit()
         con.close()
 
     # check if a queue (not) exists
